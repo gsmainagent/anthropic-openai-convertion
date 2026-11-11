@@ -293,6 +293,7 @@ async function handleCompletions(req, apiKey, incoming) {
       toolIndex: -1,
       toolBlocks: {},
       finish: null,
+      rawUsage: null,
       usage: null,
       includeUsage: !!req?.stream_options?.include_usage,
       started: false,
@@ -561,15 +562,25 @@ const STOP_REASON_MAP = {
 };
 const mapStopReason = (reason) => STOP_REASON_MAP[reason] ?? (reason ? "stop" : null);
 
+// OpenRouter / OpenAI Chat Completions usage shape:
+//   prompt_tokens      = every input token, cache reads AND cache writes included
+//   completion_tokens  = every output token
+//   prompt_tokens_details.cached_tokens     = cache reads
+//   prompt_tokens_details.cache_write_tokens = cache writes
+// Anthropic reports input_tokens WITHOUT the cache buckets, so both are added
+// back in here.
 function usageFromAnthropic(u) {
   if (!u) return undefined;
-  const prompt = u.input_tokens ?? 0;
+  const cacheRead = u.cache_read_input_tokens ?? 0;
+  const cacheWrite = u.cache_creation_input_tokens ?? 0;
+  const prompt = (u.input_tokens ?? 0) + cacheRead + cacheWrite;
   const completion = u.output_tokens ?? 0;
-  const usage = { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion };
-  if (u.cache_read_input_tokens != null || u.cache_creation_input_tokens != null) {
-    usage.prompt_tokens_details = { cached_tokens: u.cache_read_input_tokens ?? 0 };
-  }
-  return usage;
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    prompt_tokens_details: { cached_tokens: cacheRead, cache_write_tokens: cacheWrite },
+  };
 }
 
 function transformResponse(message, fallbackModel) {
@@ -633,7 +644,13 @@ function anthropicToOpenAiStream(state) {
         const m = ev.message ?? {};
         if (m.id) state.id = "chatcmpl-" + String(m.id).replace(/^msg_/, "");
         if (m.model) state.model = m.model;
-        if (m.usage) state.usage = usageFromAnthropic(m.usage);
+        if (m.usage) {
+          // Accumulate RAW Anthropic usage: message_delta only carries
+          // output_tokens, merging converted objects would zero out the prompt
+          // counts learned from message_start.
+          state.rawUsage = { ...(state.rawUsage ?? {}), ...m.usage };
+          state.usage = usageFromAnthropic(state.rawUsage);
+        }
         if (!state.started) {
           state.started = true;
           emit(controller, chunk(state, { role: "assistant", content: "" }));
@@ -676,7 +693,10 @@ function anthropicToOpenAiStream(state) {
       }
       case "message_delta": {
         if (ev.delta?.stop_reason) state.finish = mapStopReason(ev.delta.stop_reason);
-        if (ev.usage) state.usage = { ...(state.usage ?? {}), ...usageFromAnthropic(ev.usage) };
+        if (ev.usage) {
+          state.rawUsage = { ...(state.rawUsage ?? {}), ...ev.usage };
+          state.usage = usageFromAnthropic(state.rawUsage);
+        }
         break;
       }
       case "error": {

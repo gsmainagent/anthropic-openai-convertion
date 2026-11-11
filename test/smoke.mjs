@@ -6,6 +6,7 @@
  *   node test/smoke.mjs
  */
 import { createServer } from "node:http";
+import assert from "node:assert/strict";
 
 /* ------------------------------------------------------------ mock upstream */
 
@@ -14,6 +15,11 @@ let modelsHits = 0;
 let failModels = false;
 const MODEL = "claude-sonnet-5";
 const MODEL2 = "claude-haiku-4-5";
+
+// Anthropic reports input_tokens WITHOUT the cache buckets.
+const CACHE_READ = 500;
+const CACHE_WRITE = 200;
+const usageText = { input_tokens: 10, output_tokens: 3, cache_read_input_tokens: CACHE_READ, cache_creation_input_tokens: CACHE_WRITE };
 
 const sse = (obj) => `event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`;
 
@@ -45,7 +51,7 @@ const upstream = createServer((req, res) => {
 
       if (body.stream) {
         res.writeHead(200, { "content-type": "text/event-stream" });
-        res.write(sse({ type: "message_start", message: { id: "msg_test1", model: MODEL, usage: { input_tokens: 10, output_tokens: 1 } } }));
+        res.write(sse({ type: "message_start", message: { id: "msg_test1", model: MODEL, usage: { ...usageText, output_tokens: 1 } } }));
         if (wantsTool) {
           res.write(sse({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_1", name: "get_weather" } }));
           res.write(sse({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"city":' } }));
@@ -68,13 +74,13 @@ const upstream = createServer((req, res) => {
         res.end(JSON.stringify({
           id: "msg_test2", type: "message", role: "assistant", model: MODEL, stop_reason: "tool_use",
           content: [{ type: "tool_use", id: "toolu_1", name: "get_weather", input: { city: "Paris" } }],
-          usage: { input_tokens: 10, output_tokens: 12 },
+          usage: { ...usageText, output_tokens: 12 },
         }));
       } else {
         res.end(JSON.stringify({
           id: "msg_test2", type: "message", role: "assistant", model: MODEL, stop_reason: "end_turn",
           content: [{ type: "text", text: "PONG" }],
-          usage: { input_tokens: 10, output_tokens: 3 },
+          usage: usageText,
         }));
       }
       return;
@@ -177,6 +183,7 @@ console.log("\n[ENABLED_MODELS: upstream fails → static only]");
 /* -------------------------------------------------------- non-streaming --- */
 
 console.log("\n[non-stream, text]");
+let textUsage;
 {
   const res = await call("/v1/chat/completions", { model: MODEL, messages: baseMessages, max_tokens: 40, stream: false });
   const ct = res.headers.get("content-type") || "";
@@ -187,7 +194,11 @@ console.log("\n[non-stream, text]");
   ok(json.object === "chat.completion", "object=chat.completion");
   ok(json.choices[0].message.content === "PONG", "content=PONG");
   ok(json.choices[0].finish_reason === "stop", "finish_reason=stop");
-  ok(json.usage.prompt_tokens === 10 && json.usage.completion_tokens === 3, "usage mapped");
+  ok(json.usage.prompt_tokens === 710 && json.usage.completion_tokens === 3, "usage: prompt includes cache read+write (10+500+200), completion=3");
+  ok(json.usage.total_tokens === json.usage.prompt_tokens + json.usage.completion_tokens, "usage: total == prompt + completion");
+  assert.deepEqual(json.usage.prompt_tokens_details, { cached_tokens: CACHE_READ, cache_write_tokens: CACHE_WRITE });
+  ok(true, "usage: cache read/write exposed as cached_tokens / cache_write_tokens");
+  textUsage = json.usage;
   ok(lastRequestBody.system === "You are terse.", "system hoisted to top-level");
   ok(lastRequestBody.max_tokens === 40, "max_tokens forwarded");
   ok(!("stream" in lastRequestBody) || lastRequestBody.stream === false, "stream=false forwarded");
@@ -207,6 +218,24 @@ console.log("\n[stream, text]");
   const last = objs.find((o) => o.choices[0]?.finish_reason);
   ok(last && last.choices[0].finish_reason === "stop", "finish_reason=stop emitted");
   ok(objs.every((o) => o.object === "chat.completion.chunk"), "all chunks are chat.completion.chunk");
+  ok(objs.every((o) => o.usage == null), "no include_usage -> no usage chunk");
+}
+
+console.log("\n[stream, text, stream_options.include_usage]");
+{
+  const res = await call("/v1/chat/completions", {
+    model: MODEL,
+    messages: baseMessages,
+    max_tokens: 40,
+    stream: true,
+    stream_options: { include_usage: true },
+  });
+  const objs = (await res.text()).split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim()).filter((e) => e && e !== "[DONE]").map((e) => JSON.parse(e));
+  const withUsage = objs.filter((o) => o.usage != null);
+  ok(withUsage.length === 1, "exactly one chunk carries usage");
+  assert.deepEqual(withUsage[0].usage, textUsage);
+  ok(true, "stream usage is field-for-field identical to non-stream (prompt_tokens not zeroed by message_delta)");
+  ok(withUsage[0].choices.length === 0, "usage chunk has empty choices (OpenAI convention)");
 }
 
 /* ----------------------------------------------------------- tool calls --- */

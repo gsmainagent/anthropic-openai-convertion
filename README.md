@@ -196,8 +196,15 @@ Response (Anthropic → OpenAI):
 - `content[].thinking` → `message.reasoning_content`
 - `stop_reason`: `end_turn`/`stop_sequence` → `stop`, `max_tokens` → `length`,
   `tool_use` → `tool_calls`
-- `usage.input_tokens`/`output_tokens` → `prompt_tokens`/`completion_tokens`
-  (+ `prompt_tokens_details.cached_tokens` from cache read)
+- `usage` follows the OpenAI / OpenRouter Chat Completions shape:
+  - `prompt_tokens` = `input_tokens` + `cache_read_input_tokens` +
+    `cache_creation_input_tokens` — i.e. **all** input tokens, cached ones included
+    (Anthropic's `input_tokens` alone excludes the cache buckets)
+  - `completion_tokens` = `output_tokens`
+  - `total_tokens` = `prompt_tokens` + `completion_tokens`
+  - `prompt_tokens_details.cached_tokens` = `cache_read_input_tokens`
+  - `prompt_tokens_details.cache_write_tokens` = `cache_creation_input_tokens`
+    (always present, `0` when upstream reports none)
 
 Streaming:
 
@@ -206,6 +213,9 @@ Streaming:
 - `thinking_delta` → `delta.reasoning_content`
 - `tool_use` block → `delta.tool_calls[i]` (start + `input_json_delta` as arguments)
 - final chunk carries `finish_reason`, then optional `usage`, then `data: [DONE]`
+  (`usage` only with `stream_options.include_usage`; the streamed usage is
+  accumulated from the raw Anthropic fields, so it matches the non-stream shape
+  field for field)
 
 ## Tests
 
